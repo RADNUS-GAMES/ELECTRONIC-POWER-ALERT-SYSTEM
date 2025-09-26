@@ -1,0 +1,183 @@
+/* Smart Power Line Fault Detection + GSM SMS Alerts (Improved v2)
+   ESP32 + SIM800L
+   Fixes:
+   - Improved ADC RMS sampling
+   - Non-blocking GSM responses
+   - Persistent fault state handling
+   - Reduced blocking delays
+*/
+
+#include <HardwareSerial.h>
+
+// -------- USER CONFIG ----------
+const char PHONE_NUMBER[] = "+911234567890"; // recipient
+const String NODE_ID = "Node-01";
+
+const int PIN_CT   = 34;      
+const int PIN_VOLT = 35;    
+const int PIN_BUZZ = 26;
+const int PIN_LED  = 27;
+
+const int GSM_TX_PIN = 17; // ESP32 TX -> GSM RX
+const int GSM_RX_PIN = 16; // ESP32 RX <- GSM TX
+HardwareSerial SerialGSM(1);
+
+const float ADC_REF = 3.3;
+const int ADC_MAX = 4095;
+const int SAMPLE_WINDOW_MS = 300; 
+const int SAMPLE_INTERVAL_US = 500;
+
+const float CT_SCALE = 30.0;    // Calibrate for your CT
+const float VOLT_SCALE = 140.0; // Calibrate for ZMPT
+
+// Fault thresholds
+const float I_HIGH_THRESHOLD = 80.0;  
+const float V_LOW_THRESHOLD  = 120.0;  
+const float I_MIN_FOR_OUTAGE = 1.0;   
+
+const int OUTAGE_DEBOUNCE = 3;
+const int HIGH_DEBOUNCE   = 2;
+const unsigned long MIN_SMS_INTERVAL = 60UL * 1000UL; // 1 minute
+
+// ---------------- VARIABLES ----------------
+unsigned long lastSmsTime = 0;
+int outageCount = 0;
+int highCount   = 0;
+bool faultActive = false;
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_BUZZ, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
+
+  digitalWrite(PIN_BUZZ, LOW);
+  digitalWrite(PIN_LED, LOW);
+
+  Serial.println("Smart Fault Detector v2 booting...");
+
+  SerialGSM.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+  delay(500);
+  initializeGSM();
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  float Irms = ct_adc_to_amp(readADC_RMS(PIN_CT, SAMPLE_WINDOW_MS));
+  float Vrms = volt_adc_to_vrms(readADC_RMS(PIN_VOLT, SAMPLE_WINDOW_MS));
+
+  Serial.printf("Vrms=%.1f V, Irms=%.2f A\n", Vrms, Irms);
+
+  // Fault detection
+  bool outageDetected = false;
+  bool highDetected   = false;
+
+  if (Vrms < V_LOW_THRESHOLD && Irms <= I_MIN_FOR_OUTAGE) {
+    outageCount++;
+    highCount = 0;
+    if (outageCount >= OUTAGE_DEBOUNCE) outageDetected = true;
+  } 
+  else if (Irms > I_HIGH_THRESHOLD) {
+    highCount++;
+    outageCount = 0;
+    if (highCount >= HIGH_DEBOUNCE) highDetected = true;
+  } 
+  else {
+    outageCount = 0;
+    highCount = 0;
+    if (faultActive) {
+      // fault cleared
+      digitalWrite(PIN_LED, LOW);
+      digitalWrite(PIN_BUZZ, LOW);
+      Serial.println("✅ Fault cleared.");
+      faultActive = false;
+    }
+  }
+
+  // Alarm & SMS
+  if (outageDetected || highDetected) {
+    digitalWrite(PIN_LED, HIGH);
+    digitalWrite(PIN_BUZZ, HIGH);
+    faultActive = true;
+
+    if (millis() - lastSmsTime > MIN_SMS_INTERVAL) {
+      String message = NODE_ID + " ALERT: ";
+      if (outageDetected) message += "[OUTAGE] ";
+      if (highDetected)   message += "[HIGH_CURRENT] ";
+      message += "I=" + String(Irms,2) + "A V=" + String(Vrms,1) + "V";
+
+      sendSMS(message, PHONE_NUMBER);
+      lastSmsTime = millis();
+    } else {
+      Serial.println("⚠️ SMS suppressed (anti-spam).");
+    }
+  }
+
+  // check GSM responses non-blocking
+  readGSMResponses(50); 
+
+  delay(200);
+}
+
+// ---------------- FUNCTIONS ----------------
+float readADC_RMS(int pin, int window_ms) {
+  unsigned long start = millis();
+  double sumSq = 0;
+  unsigned long samples = 0;
+
+  while (millis() - start < window_ms) {
+    int raw = analogRead(pin);
+    float v = (raw / (float)ADC_MAX) * ADC_REF;
+    float ac = v - (ADC_REF/2.0);  // assumes midpoint bias
+    sumSq += ac*ac;
+    samples++;
+    delayMicroseconds(SAMPLE_INTERVAL_US);
+  }
+
+  return (samples > 0) ? sqrt(sumSq/samples) : 0.0;
+}
+
+float ct_adc_to_amp(float vrms_adc)    { return vrms_adc * CT_SCALE; }
+float volt_adc_to_vrms(float vrms_adc) { return vrms_adc * VOLT_SCALE; }
+
+void initializeGSM() {
+  Serial.println("Initializing GSM...");
+  flushGSM();
+  sendAT("AT");
+  sendAT("AT+CMGF=1"); // SMS text mode
+  Serial.println("GSM ready.");
+}
+
+void sendAT(const char* cmd, unsigned long timeout=2000) {
+  SerialGSM.println(cmd);
+  Serial.print("GSM-> "); Serial.println(cmd);
+  unsigned long start = millis();
+  while (millis()-start < timeout) {
+    if (SerialGSM.available()) {
+      String resp = SerialGSM.readStringUntil('\n');
+      resp.trim();
+      if (resp.length()) Serial.println("GSM< "+resp);
+    }
+  }
+}
+
+void sendSMS(String message, const char* number) {
+  Serial.println("📩 Sending SMS: " + message);
+  SerialGSM.print("AT+CMGS=\""); SerialGSM.print(number); SerialGSM.println("\"");
+  delay(300);
+  SerialGSM.print(message);
+  SerialGSM.write(26); // CTRL+Z
+}
+
+void readGSMResponses(unsigned long timeout_ms) {
+  unsigned long start = millis();
+  while (millis()-start < timeout_ms) {
+    while (SerialGSM.available()) {
+      String line = SerialGSM.readStringUntil('\n');
+      line.trim();
+      if (line.length()) Serial.println("GSM< "+line);
+    }
+  }
+}
+
+void flushGSM() { while (SerialGSM.available()) SerialGSM.read(); }
